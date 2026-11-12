@@ -32,9 +32,9 @@ MIN_LINES = 3                # 읽은 줄이 이보다 적은 이미지는 메�
 # ================
 
 BASE = Path(__file__).resolve().parent
-IMG_DIR = BASE / "images"
+IMG_DIR = BASE.parent / "images"
 DB_PATH = BASE / "menus_ocr.db"
-OUT_HTML = BASE / "today_menu.html"
+OUT_HTML = BASE.parent / "index.html"
 
 # 줄 끝에 있는 가격 (예: 7,000 / 7000원)
 PRICE_RE = re.compile(r"(\d{1,3}(?:,\d{3})+|\d{4,6})\s*원?\s*$")
@@ -147,7 +147,7 @@ def collect(con: sqlite3.Connection) -> None:
                 if len(lines) < MIN_LINES:
                     print(f"    이미지 {n}: 글자가 적어 건너뜀")
                     continue
-                rel = img.relative_to(BASE).as_posix()
+                rel = img.relative_to(OUT_HTML.parent).as_posix()
                 for line in lines:
                     name, price = split_price(line)
                     con.execute(
