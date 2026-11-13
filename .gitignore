@@ -1,2 +1,9 @@
+# 올리지 않을 파일 (이 폴더 안에서만 적용)
 menus_ocr.db
+run_log.txt
+root.txt
 __pycache__/
+# 예전 버전이 이 폴더에 만들던 결과물
+images/
+index.html
+today_menu.html

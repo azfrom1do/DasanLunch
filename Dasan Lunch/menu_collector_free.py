@@ -2,11 +2,18 @@
 인스타그램 식당 3곳의 오늘 메뉴 이미지를 받아서 정리하는 프로그램 (무료 버전)
 
 흐름: 게시물 수집(instaloader) -> 이미지 다운로드 -> EasyOCR로 글자 읽기
-      -> SQLite 저장 -> today_menu.html 생성
+      -> SQLite 저장 -> index.html 생성
+
+규칙
+  - 오늘 올라온 게시물이 있으면 그 게시물의 이미지를 사용합니다.
+  - 오늘 게시물이 없으면(또는 못 찾으면) 가장 최근 게시물의 이미지를 사용합니다.
+  - 글자가 잘 안 읽혀도 이미지는 항상 보여줍니다.
+  - 인스타그램 접속에 실패하면 이전에 가져온 결과를 그대로 보여줍니다.
+  - 실행 내용은 화면과 run_log.txt 에 함께 남습니다.
 
 사전 준비
   pip install instaloader easyocr requests
-  아래 ACCOUNTS 에 식당 인스타 아이디 3개 입력
+  아래 ACCOUNTS 에 식당 인스타 아이디 입력
   (API 키와 결제는 필요 없습니다. 첫 실행 때 한글 모델을 자동으로 내려받습니다.)
 """
 import datetime as dt
@@ -28,13 +35,15 @@ ACCOUNTS = {
 }
 MAX_POSTS_PER_ACCOUNT = 12   # 고정 게시물이 앞에 올 수 있어서 여유 있게 확인
 MIN_CONF = 0.3               # 이 값보다 자신 없게 읽은 글자는 버림 (0~1)
-MIN_LINES = 3                # 읽은 줄이 이보다 적은 이미지는 메뉴판이 아니라고 보고 건너뜀
+# 글자 인식을 건너뛰고 이미지만 보여줄 계정 아이디 (예: {"bap_saenggak"})
+IMAGE_ONLY: set[str] = {"bap_saenggak"}
 # ================
 
 BASE = Path(__file__).resolve().parent
 IMG_DIR = BASE.parent / "images"
 DB_PATH = BASE / "menus_ocr.db"
 OUT_HTML = BASE.parent / "index.html"
+LOG_PATH = BASE / "run_log.txt"
 
 # 줄 끝에 있는 가격 (예: 7,000 / 7000원)
 PRICE_RE = re.compile(r"(\d{1,3}(?:,\d{3})+|\d{4,6})\s*원?\s*$")
@@ -44,17 +53,18 @@ def init_db() -> sqlite3.Connection:
     con = sqlite3.connect(DB_PATH)
     con.executescript(
         """
-        CREATE TABLE IF NOT EXISTS posts (
-            shortcode TEXT PRIMARY KEY,
-            restaurant TEXT,
-            post_date TEXT
-        );
         CREATE TABLE IF NOT EXISTS menus (
             post_date TEXT,
             restaurant TEXT,
             shortcode TEXT,
             name TEXT,
             price TEXT,
+            image TEXT
+        );
+        CREATE TABLE IF NOT EXISTS images (
+            post_date TEXT,
+            restaurant TEXT,
+            shortcode TEXT,
             image TEXT
         );
         """
@@ -114,6 +124,21 @@ def split_price(line: str) -> tuple[str, str]:
     return line[: m.start()].strip(), m.group(1)
 
 
+def pick_targets(profile, today: dt.date):
+    """오늘 올라온 게시물들. 없으면 가장 최근 게시물 1개. (게시물 목록, 대체 여부) 반환."""
+    posts = []
+    for i, post in enumerate(profile.get_posts()):
+        if i >= MAX_POSTS_PER_ACCOUNT:
+            break
+        posts.append(post)
+    if not posts:
+        return [], False
+    todays = [p for p in posts if p.date_local.date() == today]
+    if todays:
+        return todays, False
+    return [max(posts, key=lambda p: p.date_utc)], True
+
+
 def collect(con: sqlite3.Connection) -> None:
     print("OCR 모델 불러오는 중... (처음에는 다운로드 때문에 오래 걸립니다)")
     reader = easyocr.Reader(["ko", "en"], gpu=False)
@@ -125,39 +150,68 @@ def collect(con: sqlite3.Connection) -> None:
         print(f"[{restaurant}] @{insta_id}")
         try:
             profile = instaloader.Profile.from_username(loader.context, insta_id)
+            targets, is_fallback = pick_targets(profile, today)
         except Exception as e:
-            print(f"  ! 프로필을 가져오지 못했습니다: {e}")
+            print(f"  ! 게시물을 가져오지 못했습니다 (이전 결과를 그대로 사용): {e}")
+            continue
+        if not targets:
+            print("  게시물이 없습니다")
+            continue
+        if is_fallback:
+            print("  오늘 올라온 게시물이 없어 가장 최근 게시물을 사용합니다")
+
+        # 이미 같은 게시물을 처리해 두었으면 건너뜀
+        wanted = {p.shortcode for p in targets}
+        saved = con.execute(
+            "SELECT shortcode, image FROM images WHERE restaurant=?", (restaurant,)
+        ).fetchall()
+        if saved and {r[0] for r in saved} == wanted and all(
+            (OUT_HTML.parent / r[1]).exists() for r in saved
+        ):
+            print("  이미 최신입니다")
             continue
 
-        for i, post in enumerate(profile.get_posts()):
-            if i >= MAX_POSTS_PER_ACCOUNT:
-                break
-            post_date = post.date_local.date()
-            if post_date != today:
+        new_images, new_menus = [], []
+        for post in targets:
+            post_date = post.date_local.date().isoformat()
+            print(f"  게시물 {post.shortcode} ({post_date})")
+            try:
+                urls = image_urls(post)
+            except Exception as e:
+                print(f"    ! 이미지 주소를 가져오지 못했습니다: {e}")
                 continue
-            if con.execute("SELECT 1 FROM posts WHERE shortcode=?",
-                           (post.shortcode,)).fetchone():
-                continue  # 이미 처리한 게시물
-
-            print(f"  새 게시물 {post.shortcode}")
-            for n, url in enumerate(image_urls(post)):
+            for n, url in enumerate(urls):
                 img = IMG_DIR / insta_id / f"{post.shortcode}_{n}.jpg"
-                download(url, img)
-                lines = ocr_lines(reader, img)
-                if len(lines) < MIN_LINES:
-                    print(f"    이미지 {n}: 글자가 적어 건너뜀")
+                try:
+                    if not img.exists():
+                        download(url, img)
+                except Exception as e:
+                    print(f"    ! 이미지 {n} 다운로드 실패: {e}")
                     continue
                 rel = img.relative_to(OUT_HTML.parent).as_posix()
+                # 글자가 안 읽혀도 이미지는 항상 보여준다
+                new_images.append((post_date, restaurant, post.shortcode, rel))
+                if insta_id in IMAGE_ONLY:
+                    continue
+                try:
+                    lines = ocr_lines(reader, img)
+                except Exception as e:
+                    print(f"    ! 글자 인식 실패 (이미지만 표시): {e}")
+                    lines = []
                 for line in lines:
                     name, price = split_price(line)
-                    con.execute(
-                        "INSERT INTO menus VALUES (?,?,?,?,?,?)",
-                        (post_date.isoformat(), restaurant, post.shortcode,
-                         name, price, rel),
+                    new_menus.append(
+                        (post_date, restaurant, post.shortcode, name, price, rel)
                     )
-            con.execute("INSERT INTO posts VALUES (?,?,?)",
-                        (post.shortcode, restaurant, post_date.isoformat()))
-            con.commit()
+
+        if not new_images:
+            print("  ! 가져온 이미지가 없어 이전 결과를 그대로 사용합니다")
+            continue
+        con.execute("DELETE FROM images WHERE restaurant=?", (restaurant,))
+        con.execute("DELETE FROM menus WHERE restaurant=?", (restaurant,))
+        con.executemany("INSERT INTO images VALUES (?,?,?,?)", new_images)
+        con.executemany("INSERT INTO menus VALUES (?,?,?,?,?,?)", new_menus)
+        con.commit()
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -183,33 +237,95 @@ def render(con: sqlite3.Connection) -> None:
         "<div class='grid'>",
     ]
     for restaurant in ACCOUNTS:
+        images = con.execute(
+            "SELECT image, post_date FROM images WHERE restaurant=? ORDER BY rowid",
+            (restaurant,),
+        ).fetchall()
         rows = con.execute(
-            "SELECT name, price, image FROM menus "
-            "WHERE post_date=? AND restaurant=? ORDER BY rowid",
-            (today, restaurant),
+            "SELECT name, price FROM menus WHERE restaurant=? ORDER BY rowid",
+            (restaurant,),
         ).fetchall()
         parts.append("<div class='col'>")
         parts.append(f"<h2>{html.escape(restaurant)}</h2>")
-        if not rows:
-            parts.append("<p>아직 올라온 메뉴가 없습니다.</p></div>")
+        if not images and not rows:
+            parts.append("<p>아직 가져온 메뉴가 없습니다.</p></div>")
             continue
+        post_date = images[0][1] if images else today
+        if post_date != today:
+            parts.append(
+                f"<p class='note'>오늘 올라온 게시물이 없어 {html.escape(post_date)} "
+                "게시물을 보여줍니다.</p>"
+            )
         # 이미지 먼저
-        images = list(dict.fromkeys(r[2] for r in rows))
-        for img in images:
+        for img, _ in images:
             parts.append(f"<img src='{html.escape(img)}' alt='메뉴 원본'>")
-        # 그 다음 인식된 글자
-        parts.append("<ul>")
-        for name, price, _ in rows:
-            p = f"<span class='p'>{html.escape(price)}</span>" if price else ""
-            parts.append(f"<li>{html.escape(name)}{p}</li>")
-        parts.append("</ul></div>")
+        # 그 다음 인식된 글자 (읽힌 글자가 있을 때만)
+        if rows:
+            parts.append("<ul>")
+            for name, price in rows:
+                p = f"<span class='p'>{html.escape(price)}</span>" if price else ""
+                parts.append(f"<li>{html.escape(name)}{p}</li>")
+            parts.append("</ul>")
+        parts.append("</div>")
     parts.append("</div></body></html>")
     OUT_HTML.write_text("\n".join(parts), encoding="utf-8")
     print(f"완료: {OUT_HTML}")
 
 
+def cleanup_images(con: sqlite3.Connection) -> None:
+    """페이지에서 쓰지 않는 옛 이미지 파일을 지운다 (저장소가 커지는 것을 막음)."""
+    used = {
+        (OUT_HTML.parent / r[0]).resolve()
+        for r in con.execute("SELECT image FROM images").fetchall()
+    }
+    removed = 0
+    for f in IMG_DIR.rglob("*.jpg"):
+        if f.resolve() not in used:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass
+    if removed:
+        print(f"안 쓰는 옛 이미지 {removed}개를 정리했습니다")
+
+
+class Tee:
+    """콘솔 화면과 로그 파일에 같은 내용을 동시에 출력."""
+
+    def __init__(self, stream, log):
+        self.stream = stream
+        self.log = log
+
+    def write(self, s):
+        try:
+            self.stream.write(s)
+        except Exception:
+            pass
+        self.log.write(s)
+        self.log.flush()
+        return len(s)
+
+    def flush(self):
+        try:
+            self.stream.flush()
+        except Exception:
+            pass
+        self.log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 if __name__ == "__main__":
+    log_file = open(LOG_PATH, "w", encoding="utf-8")
+    sys.stdout = Tee(sys.stdout, log_file)
+    sys.stderr = Tee(sys.stderr, log_file)
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] 시작")
+
     con = init_db()
     if "--render-only" not in sys.argv:
         collect(con)
+        cleanup_images(con)
     render(con)
+    print(f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] 끝")
