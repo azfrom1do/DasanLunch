@@ -226,6 +226,7 @@ def render(con: sqlite3.Connection) -> None:
         "@media(max-width:900px){.grid{grid-template-columns:1fr}}"
         ".col{min-width:0}"
         "h2{border-bottom:2px solid #888;padding-bottom:.3rem;margin-top:0}"
+        ".ig{font-size:.8rem;font-weight:normal;margin-left:.6rem;color:#888}"
         "img{width:100%;display:block;margin-bottom:.6rem;border-radius:6px}"
         "ul{padding-left:1.2rem}"
         "li{margin:.2rem 0}.p{color:#888;margin-left:.5rem}"
@@ -236,7 +237,7 @@ def render(con: sqlite3.Connection) -> None:
         "헷갈리면 위의 원본 이미지를 확인하세요.</p>",
         "<div class='grid'>",
     ]
-    for restaurant in ACCOUNTS:
+    for restaurant, insta_id in ACCOUNTS.items():
         images = con.execute(
             "SELECT image, post_date FROM images WHERE restaurant=? ORDER BY rowid",
             (restaurant,),
@@ -246,7 +247,11 @@ def render(con: sqlite3.Connection) -> None:
             (restaurant,),
         ).fetchall()
         parts.append("<div class='col'>")
-        parts.append(f"<h2>{html.escape(restaurant)}</h2>")
+        parts.append(
+            f"<h2>{html.escape(restaurant)}"
+            f"<a class='ig' href='https://www.instagram.com/{html.escape(insta_id)}/' "
+            "target='_blank' rel='noopener'>인스타그램 ↗</a></h2>"
+        )
         if not images and not rows:
             parts.append("<p>아직 가져온 메뉴가 없습니다.</p></div>")
             continue
