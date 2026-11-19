@@ -39,6 +39,8 @@ MIN_CONF = 0.3               # 이 값보다 자신 없게 읽은 글자는 버�
 IMAGE_ONLY: set[str] = {"bap_saenggak"}
 # ================
 
+KST = dt.timezone(dt.timedelta(hours=9))   # 한국 시간 (PC 시간대 설정과 상관없이 사용)
+
 BASE = Path(__file__).resolve().parent
 IMG_DIR = BASE.parent / "images"
 DB_PATH = BASE / "menus_ocr.db"
@@ -70,6 +72,11 @@ def init_db() -> sqlite3.Connection:
         """
     )
     return con
+
+
+def post_time(post) -> dt.datetime:
+    """게시물이 올라온 시각을 한국 시간으로 반환."""
+    return post.date_utc.replace(tzinfo=dt.timezone.utc).astimezone(KST)
 
 
 def image_urls(post) -> list[str]:
@@ -131,8 +138,11 @@ def pick_targets(profile, today: dt.date):
         if i >= MAX_POSTS_PER_ACCOUNT:
             break
         posts.append(post)
-    todays = [p for p in posts if p.date_local.date() == today]
-    older = [p for p in posts if p.date_local.date() != today]
+    # 찾은 게시물을 로그에 남겨서, 오늘 게시물이 목록에 있는지 확인할 수 있게 한다
+    print("  찾은 게시물: " + (", ".join(
+        f"{p.shortcode}({post_time(p):%m-%d %H:%M})" for p in posts) or "없음"))
+    todays = [p for p in posts if post_time(p).date() == today]
+    older = [p for p in posts if post_time(p).date() != today]
     fallback = max(older, key=lambda p: p.date_utc) if older else None
     return todays, fallback
 
@@ -142,7 +152,7 @@ def fetch_post_images(reader, restaurant: str, insta_id: str, posts):
     글자를 못 읽거나 인식이 실패해도 이미지는 항상 남긴다."""
     new_images, new_menus = [], []
     for post in posts:
-        post_date = post.date_local.date().isoformat()
+        post_date = post_time(post).date().isoformat()
         print(f"  게시물 {post.shortcode} ({post_date})")
         try:
             urls = image_urls(post)
@@ -200,7 +210,8 @@ def collect(con: sqlite3.Connection) -> None:
     reader = easyocr.Reader(["ko", "en"], gpu=False)
     loader = instaloader.Instaloader(download_pictures=False, save_metadata=False,
                                      quiet=True)
-    today = dt.date.today()
+    today = dt.datetime.now(KST).date()
+    print(f"오늘 날짜(한국 시간): {today}")
 
     for restaurant, insta_id in ACCOUNTS.items():
         print(f"[{restaurant}] @{insta_id}")
@@ -255,7 +266,7 @@ def collect(con: sqlite3.Connection) -> None:
 
 
 def render(con: sqlite3.Connection) -> None:
-    today = dt.date.today().isoformat()
+    today = dt.datetime.now(KST).date().isoformat()
     parts = [
         "<!doctype html><html lang='ko'><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
