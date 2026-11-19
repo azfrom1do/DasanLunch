@@ -6,7 +6,7 @@
 
 규칙
   - 오늘 올라온 게시물이 있으면 그 게시물의 이미지를 사용합니다.
-  - 오늘 게시물이 없으면(또는 못 찾으면) 가장 최근 게시물의 이미지를 사용합니다.
+  - 오늘 게시물이 없거나 이미지를 못 가져오면 가장 최근 게시물의 이미지를 사용합니다.
   - 글자가 잘 안 읽혀도 이미지는 항상 보여줍니다.
   - 인스타그램 접속에 실패하면 이전에 가져온 결과를 그대로 보여줍니다.
   - 실행 내용은 화면과 run_log.txt 에 함께 남습니다.
@@ -125,22 +125,78 @@ def split_price(line: str) -> tuple[str, str]:
 
 
 def pick_targets(profile, today: dt.date):
-    """오늘 올라온 게시물들. 없으면 가장 최근 게시물 1개. (게시물 목록, 대체 여부) 반환."""
+    """(오늘 올라온 게시물들, 오늘 것을 뺀 가장 최근 게시물)을 반환."""
     posts = []
     for i, post in enumerate(profile.get_posts()):
         if i >= MAX_POSTS_PER_ACCOUNT:
             break
         posts.append(post)
-    if not posts:
-        return [], False
     todays = [p for p in posts if p.date_local.date() == today]
-    if todays:
-        return todays, False
-    return [max(posts, key=lambda p: p.date_utc)], True
+    older = [p for p in posts if p.date_local.date() != today]
+    fallback = max(older, key=lambda p: p.date_utc) if older else None
+    return todays, fallback
+
+
+def fetch_post_images(reader, restaurant: str, insta_id: str, posts):
+    """게시물들의 이미지를 내려받고 (이미지 목록, 글자 목록)을 반환.
+    글자를 못 읽거나 인식이 실패해도 이미지는 항상 남긴다."""
+    new_images, new_menus = [], []
+    for post in posts:
+        post_date = post.date_local.date().isoformat()
+        print(f"  게시물 {post.shortcode} ({post_date})")
+        try:
+            urls = image_urls(post)
+        except Exception as e:
+            print(f"    ! 이미지 주소를 가져오지 못했습니다: {e}")
+            continue
+        for n, url in enumerate(urls):
+            img = IMG_DIR / insta_id / f"{post.shortcode}_{n}.jpg"
+            try:
+                if not img.exists():
+                    download(url, img)
+            except Exception as e:
+                print(f"    ! 이미지 {n} 다운로드 실패: {e}")
+                continue
+            rel = img.relative_to(OUT_HTML.parent).as_posix()
+            new_images.append((post_date, restaurant, post.shortcode, rel))
+            if insta_id in IMAGE_ONLY:
+                continue
+            try:
+                lines = ocr_lines(reader, img)
+            except Exception as e:
+                print(f"    ! 글자 인식 실패 (이미지만 표시): {e}")
+                lines = []
+            for line in lines:
+                name, price = split_price(line)
+                new_menus.append((post_date, restaurant, post.shortcode, name, price, rel))
+    return new_images, new_menus
+
+
+def fallback_from_disk(con: sqlite3.Connection, restaurant: str, insta_id: str) -> None:
+    """인스타그램에서 못 가져왔고 저장된 결과도 없을 때,
+    이미 받아 둔 이미지 파일 중 가장 최근 게시물의 것을 사용한다."""
+    if con.execute("SELECT 1 FROM images WHERE restaurant=?", (restaurant,)).fetchone():
+        return
+    groups: dict[str, list[Path]] = {}
+    for f in (IMG_DIR / insta_id).glob("*.jpg"):
+        groups.setdefault(f.stem.rsplit("_", 1)[0], []).append(f)
+    if not groups:
+        return
+    latest = max(groups, key=lambda sc: max(f.stat().st_mtime for f in groups[sc]))
+    files = sorted(groups[latest], key=lambda f: (len(f.stem), f.stem))
+    mtime = max(f.stat().st_mtime for f in files)
+    post_date = dt.date.fromtimestamp(mtime).isoformat()
+    rows = [
+        (post_date, restaurant, latest, f.relative_to(OUT_HTML.parent).as_posix())
+        for f in files
+    ]
+    con.executemany("INSERT INTO images VALUES (?,?,?,?)", rows)
+    con.commit()
+    print("  저장해 둔 이미지 중 가장 최근 게시물을 사용합니다")
 
 
 def collect(con: sqlite3.Connection) -> None:
-    print("OCR 모델 불러오는 중... (처음에는 다운로드 때문에 오래 걸립니다)")
+    print("OCR 모델 불러오는 중...")
     reader = easyocr.Reader(["ko", "en"], gpu=False)
     loader = instaloader.Instaloader(download_pictures=False, save_metadata=False,
                                      quiet=True)
@@ -150,68 +206,52 @@ def collect(con: sqlite3.Connection) -> None:
         print(f"[{restaurant}] @{insta_id}")
         try:
             profile = instaloader.Profile.from_username(loader.context, insta_id)
-            targets, is_fallback = pick_targets(profile, today)
+            todays, fallback = pick_targets(profile, today)
         except Exception as e:
-            print(f"  ! 게시물을 가져오지 못했습니다 (이전 결과를 그대로 사용): {e}")
+            print(f"  ! 게시물을 가져오지 못했습니다: {e}")
+            fallback_from_disk(con, restaurant, insta_id)
             continue
-        if not targets:
+
+        # 시도 순서: 오늘 게시물 -> (이미지를 못 가져오면) 가장 최근 게시물
+        attempts = []
+        if todays:
+            attempts.append(todays)
+        if fallback:
+            attempts.append([fallback])
+        if not attempts:
             print("  게시물이 없습니다")
+            fallback_from_disk(con, restaurant, insta_id)
             continue
-        if is_fallback:
+        if not todays:
             print("  오늘 올라온 게시물이 없어 가장 최근 게시물을 사용합니다")
 
-        # 이미 같은 게시물을 처리해 두었으면 건너뜀
-        wanted = {p.shortcode for p in targets}
         saved = con.execute(
             "SELECT shortcode, image FROM images WHERE restaurant=?", (restaurant,)
         ).fetchall()
-        if saved and {r[0] for r in saved} == wanted and all(
-            (OUT_HTML.parent / r[1]).exists() for r in saved
-        ):
-            print("  이미 최신입니다")
-            continue
-
-        new_images, new_menus = [], []
-        for post in targets:
-            post_date = post.date_local.date().isoformat()
-            print(f"  게시물 {post.shortcode} ({post_date})")
-            try:
-                urls = image_urls(post)
-            except Exception as e:
-                print(f"    ! 이미지 주소를 가져오지 못했습니다: {e}")
-                continue
-            for n, url in enumerate(urls):
-                img = IMG_DIR / insta_id / f"{post.shortcode}_{n}.jpg"
-                try:
-                    if not img.exists():
-                        download(url, img)
-                except Exception as e:
-                    print(f"    ! 이미지 {n} 다운로드 실패: {e}")
-                    continue
-                rel = img.relative_to(OUT_HTML.parent).as_posix()
-                # 글자가 안 읽혀도 이미지는 항상 보여준다
-                new_images.append((post_date, restaurant, post.shortcode, rel))
-                if insta_id in IMAGE_ONLY:
-                    continue
-                try:
-                    lines = ocr_lines(reader, img)
-                except Exception as e:
-                    print(f"    ! 글자 인식 실패 (이미지만 표시): {e}")
-                    lines = []
-                for line in lines:
-                    name, price = split_price(line)
-                    new_menus.append(
-                        (post_date, restaurant, post.shortcode, name, price, rel)
-                    )
-
-        if not new_images:
-            print("  ! 가져온 이미지가 없어 이전 결과를 그대로 사용합니다")
-            continue
-        con.execute("DELETE FROM images WHERE restaurant=?", (restaurant,))
-        con.execute("DELETE FROM menus WHERE restaurant=?", (restaurant,))
-        con.executemany("INSERT INTO images VALUES (?,?,?,?)", new_images)
-        con.executemany("INSERT INTO menus VALUES (?,?,?,?,?,?)", new_menus)
-        con.commit()
+        done = False
+        for idx, posts in enumerate(attempts):
+            wanted = {p.shortcode for p in posts}
+            # 이미 같은 게시물을 처리해 두었으면 건너뜀
+            if saved and {r[0] for r in saved} == wanted and all(
+                (OUT_HTML.parent / r[1]).exists() for r in saved
+            ):
+                print("  이미 최신입니다")
+                done = True
+                break
+            new_images, new_menus = fetch_post_images(reader, restaurant, insta_id, posts)
+            if new_images:
+                con.execute("DELETE FROM images WHERE restaurant=?", (restaurant,))
+                con.execute("DELETE FROM menus WHERE restaurant=?", (restaurant,))
+                con.executemany("INSERT INTO images VALUES (?,?,?,?)", new_images)
+                con.executemany("INSERT INTO menus VALUES (?,?,?,?,?,?)", new_menus)
+                con.commit()
+                done = True
+                break
+            if idx + 1 < len(attempts):
+                print("  ! 이미지를 가져오지 못해 가장 최근 게시물로 다시 시도합니다")
+        if not done:
+            print("  ! 이미지를 가져오지 못해 이전 결과를 그대로 사용합니다")
+            fallback_from_disk(con, restaurant, insta_id)
 
 
 def render(con: sqlite3.Connection) -> None:
@@ -258,8 +298,8 @@ def render(con: sqlite3.Connection) -> None:
         post_date = images[0][1] if images else today
         if post_date != today:
             parts.append(
-                f"<p class='note'>오늘 올라온 게시물이 없어 {html.escape(post_date)} "
-                "게시물을 보여줍니다.</p>"
+                f"<p class='note'>오늘 게시물이 없거나 가져오지 못해 "
+                f"{html.escape(post_date)} 게시물을 보여줍니다.</p>"
             )
         # 이미지 먼저
         for img, _ in images:
