@@ -18,9 +18,12 @@
 """
 import datetime as dt
 import html
+import random
 import re
 import sqlite3
 import sys
+import time
+import traceback
 from pathlib import Path
 
 import easyocr
@@ -74,12 +77,118 @@ def init_db() -> sqlite3.Connection:
     return con
 
 
+def describe_error(e: BaseException) -> str:
+    """에러와 그 원인을 한 줄로 정리 (인스타그램이 막았는지 등을 구분하기 위함)."""
+    parts, cur = [], e
+    while cur is not None and len(parts) < 4:
+        parts.append(f"{type(cur).__name__}: {cur}")
+        cur = cur.__cause__ or cur.__context__
+    return "  <-  ".join(parts)
+
+
 def post_time(post) -> dt.datetime:
     """게시물이 올라온 시각을 한국 시간으로 반환."""
     return post.date_utc.replace(tzinfo=dt.timezone.utc).astimezone(KST)
 
 
+INSTA_EPOCH_MS = 1314220021721   # 인스타그램 게시물 id에 쓰이는 기준 시각 (밀리초)
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+}
+# 임베드 페이지 안의 이미지 주소 (글자가 여러 번 이스케이프돼 있어도 찾도록 느슨하게 작성)
+DISPLAY_URL_RE = re.compile(
+    r"""display_ur[li]\\*"\s*:\s*\\*"(https:(?:[^"'\s<>\\]|\\+/|\\+u0026)+)"""
+)
+
+
+def pk_time(pk) -> dt.datetime:
+    """게시물 id(pk)에는 올라온 시각이 들어 있다. UTC 시각(시간대 없음)으로 반환."""
+    ms = (int(pk) >> 23) + INSTA_EPOCH_MS
+    return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).replace(tzinfo=None)
+
+
+def embed_image_urls(code: str) -> list[str]:
+    """게시물 공개 임베드 페이지에서 원본 크기 이미지 주소들을 찾는다 (여러 장이면 전부)."""
+    r = requests.get(f"https://www.instagram.com/p/{code}/embed/captioned/",
+                     headers=BROWSER_HEADERS, timeout=30)
+    r.raise_for_status()
+    urls, seen = [], set()
+    for raw in DISPLAY_URL_RE.findall(r.text):
+        u = re.sub(r"\\+/", "/", raw)
+        u = html.unescape(re.sub(r"\\+u0026", "&", u))
+        key = u.split("?")[0].rsplit("/", 1)[-1]   # 같은 이미지의 중복 제거
+        if key not in seen:
+            seen.add(key)
+            urls.append(u)
+    return urls
+
+
+class LitePost:
+    """프로필 페이지의 게시물 목록 항목 하나.
+    instaloader는 게시물마다 상세 정보를 따로 요청하는데 그 요청이 막혀 있어서,
+    목록에 이미 들어 있는 정보(코드, id, 대표 이미지)만으로 처리한다."""
+
+    def __init__(self, node: dict):
+        self.shortcode = node["code"]
+        self.pk = node["pk"]
+        self.media_type = node.get("media_type")      # 1 사진, 2 영상, 8 여러 장
+        self.cover = node.get("display_uri")
+        self.date_utc = pk_time(self.pk)
+
+    def image_urls(self) -> list[str]:
+        try:
+            urls = embed_image_urls(self.shortcode)
+        except Exception as e:
+            print(f"    (원본 이미지 주소를 못 가져와 대표 이미지를 사용합니다: {describe_error(e)})")
+            urls = []
+        if not urls:
+            if self.media_type == 8:
+                print("    ! 여러 장짜리 게시물이지만 첫 장만 가져옵니다")
+            urls = [self.cover] if self.cover else []
+        return urls
+
+
+def lite_posts(loader, insta_id: str) -> list:
+    """프로필 페이지 한 번으로 최근 게시물 목록을 가져온다."""
+    page = loader.context.get_page_data(f"{insta_id}/")
+    user = next(
+        (d["xig_user_by_username"] for d in page
+         if "polaris_ordered_timeline_connection" in (d.get("xig_user_by_username") or {})),
+        None,
+    )
+    if user is None:
+        raise RuntimeError("프로필 페이지에서 게시물 목록을 찾지 못했습니다")
+    edges = user["polaris_ordered_timeline_connection"].get("edges") or []
+    posts = []
+    for e in edges[:MAX_POSTS_PER_ACCOUNT]:
+        node = e.get("node", e)
+        if node.get("code") and node.get("pk"):
+            posts.append(LitePost(node))
+    if not posts:
+        raise RuntimeError("게시물 목록이 비어 있습니다")
+    return posts
+
+
+def list_posts(loader, insta_id: str) -> list:
+    """최근 게시물 목록. 간편 방식이 실패하면 instaloader 기본 방식으로 다시 시도."""
+    try:
+        return lite_posts(loader, insta_id)
+    except Exception as e:
+        print(f"  (간편 방식 실패: {describe_error(e)})")
+        print("  (instaloader 기본 방식으로 다시 시도합니다)")
+    profile = instaloader.Profile.from_username(loader.context, insta_id)
+    posts = []
+    for i, post in enumerate(profile.get_posts()):
+        if i >= MAX_POSTS_PER_ACCOUNT:
+            break
+        posts.append(post)
+    return posts
+
+
 def image_urls(post) -> list[str]:
+    if isinstance(post, LitePost):
+        return post.image_urls()
     if post.typename == "GraphSidecar":
         return [n.display_url for n in post.get_sidecar_nodes()]
     return [post.url]
@@ -131,13 +240,8 @@ def split_price(line: str) -> tuple[str, str]:
     return line[: m.start()].strip(), m.group(1)
 
 
-def pick_targets(profile, today: dt.date):
+def pick_targets(posts, today: dt.date):
     """(오늘 올라온 게시물들, 오늘 것을 뺀 가장 최근 게시물)을 반환."""
-    posts = []
-    for i, post in enumerate(profile.get_posts()):
-        if i >= MAX_POSTS_PER_ACCOUNT:
-            break
-        posts.append(post)
     # 찾은 게시물을 로그에 남겨서, 오늘 게시물이 목록에 있는지 확인할 수 있게 한다
     print("  찾은 게시물: " + (", ".join(
         f"{p.shortcode}({post_time(p):%m-%d %H:%M})" for p in posts) or "없음"))
@@ -216,11 +320,14 @@ def collect(con: sqlite3.Connection) -> None:
     for restaurant, insta_id in ACCOUNTS.items():
         print(f"[{restaurant}] @{insta_id}")
         try:
-            profile = instaloader.Profile.from_username(loader.context, insta_id)
-            todays, fallback = pick_targets(profile, today)
+            posts = list_posts(loader, insta_id)
+            todays, fallback = pick_targets(posts, today)
         except Exception as e:
-            print(f"  ! 게시물을 가져오지 못했습니다: {e}")
+            print(f"  ! 게시물을 가져오지 못했습니다: {describe_error(e)}")
+            print("  (자세한 내용은 아래 기록을 확인하세요)")
+            traceback.print_exc()
             fallback_from_disk(con, restaurant, insta_id)
+            time.sleep(random.uniform(3, 6))
             continue
 
         # 시도 순서: 오늘 게시물 -> (이미지를 못 가져오면) 가장 최근 게시물
@@ -263,6 +370,7 @@ def collect(con: sqlite3.Connection) -> None:
         if not done:
             print("  ! 이미지를 가져오지 못해 이전 결과를 그대로 사용합니다")
             fallback_from_disk(con, restaurant, insta_id)
+        time.sleep(random.uniform(3, 6))
 
 
 def render(con: sqlite3.Connection) -> None:
